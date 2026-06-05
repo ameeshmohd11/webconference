@@ -15,9 +15,7 @@ let peerConnection = null;
 let dataChannel = null;
 let roomId = null;
 let isHost = false;
-let micOn = true, camOn = true;
-let screenSharing = false;
-let screenStream = null;
+let micOn = true;
 let callStartTime = null;
 let timerInterval = null;
 let chatOpen = false;
@@ -45,21 +43,36 @@ function initSocket() {
     showToast('📵 Disconnected from server');
   });
 
-  // Signal events
+  // Signal events - Set up EARLY (before rooms created)
   socket.on('offer', async (data) => {
     console.log('[Signal] Received offer from:', data.from);
+    if (!peerConnection) {
+      console.warn('[Signal] PeerConnection not ready, waiting...');
+      setTimeout(() => socket.emit('offer-ack'), 100); // Signal ready
+      return;
+    }
     if (peerConnection && !isHost) {
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-      socket.emit('answer', { answer: peerConnection.localDescription });
+      try {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('answer', { answer: peerConnection.localDescription });
+        console.log('[Signal] Answer sent');
+      } catch (e) {
+        console.error('[Signal] Error handling offer:', e);
+      }
     }
   });
 
   socket.on('answer', async (data) => {
     console.log('[Signal] Received answer from:', data.from);
     if (peerConnection && isHost) {
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+      try {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+        console.log('[Signal] Answer set');
+      } catch (e) {
+        console.error('[Signal] Error handling answer:', e);
+      }
     }
   });
 
@@ -82,8 +95,6 @@ function initSocket() {
   socket.on('user-left', (data) => {
     console.log('[Room] User left:', data.socketId);
     document.getElementById('waitingOverlay').style.display = 'flex';
-    document.getElementById('remoteVideo').srcObject = null;
-    document.getElementById('remoteAvatar').classList.add('show');
     showToast('👤 Participant left');
   });
 
@@ -98,15 +109,13 @@ function initSocket() {
   });
 }
 
-/* ─── Init local media ─── */
+/* ─── Init local media (audio only) ─── */
 async function initMedia() {
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    document.getElementById('localPreview').srcObject = localStream;
-    document.getElementById('previewOff').style.display = 'none';
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    console.log('[Audio] Local stream initialized');
   } catch (e) {
-    document.getElementById('previewOff').style.display = 'flex';
-    showToast('⚠ Camera/mic unavailable');
+    showToast('⚠ Microphone unavailable');
   }
 }
 
@@ -169,13 +178,11 @@ function setupPeerConnection() {
     }
   };
 
-  // Handle remote stream
+  // Handle remote stream (audio only)
   peerConnection.ontrack = (e) => {
     console.log('[Stream] Received remote track:', e.track.kind);
-    const remoteVideo = document.getElementById('remoteVideo');
-    remoteVideo.srcObject = e.streams[0];
+    showToast('🔊 Remote participant connected');
     document.getElementById('waitingOverlay').style.display = 'none';
-    document.getElementById('remoteAvatar').classList.remove('show');
   };
 
   // Handle connection state changes
@@ -217,9 +224,16 @@ function setupPeerConnection() {
 
 async function createAndSendOffer() {
   try {
+    // Give PeerConnection a moment to initialize
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
-    socket.emit('offer', { offer: peerConnection.localDescription });
+    
+    // Emit offer with retry logic
+    socket.emit('offer', { offer: peerConnection.localDescription }, (ack) => {
+      console.log('[Signal] Offer delivered and acknowledged');
+    });
     console.log('[Signal] Sent offer');
   } catch (e) {
     console.error('Error creating offer:', e);
@@ -233,11 +247,6 @@ function enterRoom() {
   document.getElementById('room').classList.add('active');
   document.getElementById('roomLabel').textContent = roomId;
   document.getElementById('waitingRoomId').textContent = roomId;
-
-  // Set up PiP local video
-  const pipVideo = document.getElementById('pipVideo');
-  if (localStream) pipVideo.srcObject = localStream;
-  document.getElementById('pipLocal').classList.add('show');
 }
 
 /* ─── Media controls ─── */
@@ -256,46 +265,7 @@ function toggleMic() {
 }
 
 function toggleCam() {
-  camOn = !camOn;
-  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = camOn);
-  document.getElementById('camBtn').classList.toggle('active', camOn);
-  sendData({ type: 'cam', off: !camOn });
-}
-
-async function toggleScreen() {
-  if (!screenSharing) {
-    try {
-      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-      const screenTrack = screenStream.getVideoTracks()[0];
-
-      if (peerConnection) {
-        const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(screenTrack);
-      }
-
-      screenTrack.onended = () => stopScreen();
-      document.getElementById('screenBtn').classList.add('active');
-      screenSharing = true;
-      showToast('🖥 Screen sharing started');
-    } catch (e) {
-      showToast('Screen share cancelled');
-    }
-  } else {
-    stopScreen();
-  }
-}
-
-async function stopScreen() {
-  if (!screenSharing) return;
-  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
-  if (peerConnection && localStream) {
-    const camTrack = localStream.getVideoTracks()[0];
-    const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender && camTrack) await sender.replaceTrack(camTrack);
-  }
-  document.getElementById('screenBtn').classList.remove('active');
-  screenSharing = false;
-  showToast('🖥 Screen sharing stopped');
+  // Video disabled - audio only mode
 }
 
 /* ─── Data channel / chat ─── */
@@ -387,25 +357,18 @@ function copyRoomId() {
 /* ─── Leave ─── */
 function leaveCall() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
-  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); }
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 
   // Reset UI
   document.getElementById('room').classList.remove('active');
   document.getElementById('lobby').classList.add('active');
-  document.getElementById('remoteVideo').srcObject = null;
   document.getElementById('waitingOverlay').style.display = 'flex';
-  document.getElementById('pipLocal').classList.remove('show');
   document.getElementById('callTimer').textContent = '00:00';
   document.getElementById('chatMessages').innerHTML = '';
   document.getElementById('chatPanel').classList.remove('open');
   chatOpen = false;
   micOn = true;
-  camOn = true;
-  screenSharing = false;
   document.getElementById('micBtn').classList.add('active');
-  document.getElementById('camBtn').classList.add('active');
-  document.getElementById('screenBtn').classList.remove('active');
   setStatus('');
 
   roomId = null;
